@@ -1,0 +1,121 @@
+name: Sync upstream
+
+# Keeps this fork current with the original repository without moving `main`
+# on its own: scheduled runs open or update a pull request against `main`, and
+# merging that PR stays a deliberate choice. Pulling the merged result into a
+# local clone is always manual (`git pull origin main`).
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai (01:00 UTC).
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      direct_push:
+        description: "Merge upstream/main and push directly to main instead of opening a PR"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync upstream/main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: TauricResearch/TradingAgents
+      SYNC_BRANCH: sync/upstream
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+
+      - name: Check for new commits
+        id: check
+        run: |
+          count="$(git rev-list --count HEAD..upstream/main)"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          if [ "$count" = "0" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "No new commits on upstream/main."
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            git log --oneline HEAD..upstream/main > /tmp/new-commits.txt
+            cat /tmp/new-commits.txt
+          fi
+
+      - name: Merge and push to main
+        if: steps.check.outputs.up_to_date == 'false' && inputs.direct_push
+        run: |
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
+
+      - name: Prepare sync branch
+        if: steps.check.outputs.up_to_date == 'false' && !inputs.direct_push
+        run: |
+          git switch -C "$SYNC_BRANCH"
+          git merge --no-edit upstream/main
+          git fetch origin "$SYNC_BRANCH" || true
+          git push --force-with-lease origin "$SYNC_BRANCH"
+
+      - name: Open or update pull request
+        if: steps.check.outputs.up_to_date == 'false' && !inputs.direct_push
+        run: |
+          body_file=/tmp/pr-body.md
+          {
+            echo "Automated sync of \`upstream/main\` into \`main\`."
+            echo
+            echo "**New upstream commits**"
+            echo
+            echo '```'
+            cat /tmp/new-commits.txt
+            echo '```'
+            echo
+            echo "Merge this PR when you want the fork's \`main\` to advance."
+            echo "Local clones only change after \`git pull origin main\`."
+          } > "$body_file"
+
+          number="$(gh pr list --head "$SYNC_BRANCH" --state open \
+            --json number --jq '.[0].number')"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" \
+              --title "chore: sync upstream/main" \
+              --body-file "$body_file"
+          else
+            gh pr create \
+              --base main \
+              --head "$SYNC_BRANCH" \
+              --title "chore: sync upstream/main" \
+              --body-file "$body_file"
+          fi
+
+      - name: Summarize
+        run: |
+          if [ "${{ steps.check.outputs.up_to_date }}" = "true" ]; then
+            echo "upstream/main has no new commits." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ inputs.direct_push }}" = "true" ]; then
+            echo "Merged upstream/main and pushed to main." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Opened or updated the upstream sync pull request." >> "$GITHUB_STEP_SUMMARY"
+          fi
